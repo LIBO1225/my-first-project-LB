@@ -1,0 +1,40 @@
+Review package: practical low-SNR NMR logging algorithm
+
+Files required to run:
+1. pinn_nmr_filter_ascii.py
+2. en1.xlsx
+
+Python packages required:
+- numpy
+- pandas
+- tensorflow
+- matplotlib
+- xlsxwriter
+
+Recommended command:
+    python pinn_nmr_filter_ascii.py
+
+Expected console behavior:
+1. Print an SVD-based initial T2 estimate.
+2. Print the loss history for two training phases.
+3. Report the generated output files.
+
+Expected output files:
+1. filter_results_physics_guided_pinn.xlsx
+2. time_freq_analysis_ascii.png
+
+Verification sequence:
+1. Open filter_results_physics_guided_pinn.xlsx.
+2. Confirm that the table contains three columns:
+   time_s, raw_signal, filtered_signal
+3. Confirm that the chart compares the raw and filtered echo trains.
+4. Open time_freq_analysis_ascii.png.
+5. Confirm that the upper panel shows the time-domain comparison and
+   the lower panel shows the frequency-domain comparison.
+
+Example execution sequence:
+1. Copy pinn_nmr_filter_ascii.py and en1.xlsx into the same directory.
+2. Open a terminal in that directory.
+3. Run:
+       python pinn_nmr_filter_ascii.py
+4. Inspect the console output and the two generated files.

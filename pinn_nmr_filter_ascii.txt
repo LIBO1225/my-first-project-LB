@@ -1,0 +1,398 @@
+#!/usr/bin/env python
+# -*- coding: ascii -*-
+"""
+ASCII review package for the practical low-SNR NMR logging algorithm.
+
+This implementation mirrors the workflow described in the manuscript:
+1. Read a noisy NMR echo train from an Excel file.
+2. Normalize time and amplitude.
+3. Build a Hankel matrix and apply truncated SVD for the initial T2 estimate.
+4. Train an Enhanced PINN with a data-fidelity term and a physics loss term.
+5. Export the filtered signal to an Excel table and save a time/frequency plot.
+
+Required input file:
+    en1.xlsx
+
+Generated output files:
+    filter_results_physics_guided_pinn.xlsx
+    time_freq_analysis_ascii.png
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+DATA_PATH = "en1.xlsx"
+OUTPUT_XLSX = "filter_results_physics_guided_pinn.xlsx"
+OUTPUT_PLOT = "time_freq_analysis_ascii.png"
+TE = 0.9e-3
+
+
+def load_input_signal(data_path: str = DATA_PATH) -> tuple[np.ndarray, np.ndarray]:
+    """Read the echo train and build the time axis."""
+    raw_signal = pd.read_excel(data_path, header=None).iloc[0].values.astype(np.float32)
+    time_axis = (np.arange(len(raw_signal)) * TE).astype(np.float32)
+    return time_axis, raw_signal
+
+
+def minmax_normalize(values: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Normalize a one-dimensional array to the range [0, 1]."""
+    value_min = float(values.min())
+    value_max = float(values.max())
+    normalized = (values - value_min) / (value_max - value_min)
+    return normalized.astype(np.float32), value_min, value_max
+
+
+def hankel_svd_filter(signal: np.ndarray, rank: int = 2, window: int | None = None) -> np.ndarray:
+    """Apply the fixed-rank Hankel-SVD denoising step described in the manuscript."""
+    signal = np.asarray(signal, dtype=np.float32)
+    n_samples = len(signal)
+
+    if window is None:
+        window = n_samples // 2
+    window = max(8, min(window, n_samples - 1))
+    n_cols = n_samples - window + 1
+
+    hankel = np.empty((window, n_cols), dtype=np.float32)
+    for row in range(window):
+        hankel[row, :] = signal[row:row + n_cols]
+
+    u, singular_values, vt = np.linalg.svd(hankel, full_matrices=False)
+    singular_values[rank:] = 0.0
+    hankel_recon = (u * singular_values) @ vt
+
+    signal_recon = np.zeros(n_samples, dtype=np.float32)
+    counts = np.zeros(n_samples, dtype=np.float32)
+    for row in range(window):
+        signal_recon[row:row + n_cols] += hankel_recon[row, :]
+        counts[row:row + n_cols] += 1.0
+
+    return signal_recon / np.maximum(counts, 1.0)
+
+
+def estimate_nonnegative_amplitudes(
+    kernel: np.ndarray,
+    signal: np.ndarray,
+    max_iter: int = 300,
+    ridge: float = 1e-4,
+) -> np.ndarray:
+    """
+    Estimate the non-negative initial amplitudes of the multi-exponential model.
+
+    A multiplicative update is used so the support code stays self-contained and
+    does not require extra optimization packages.
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    amplitudes = np.maximum(np.linalg.lstsq(kernel, signal, rcond=None)[0], 1e-8).astype(np.float32)
+
+    kt_y = kernel.T @ signal
+    kt_k = kernel.T @ kernel
+
+    for _ in range(max_iter):
+        denominator = kt_k @ amplitudes + ridge * amplitudes + 1e-8
+        amplitudes *= kt_y / denominator
+        amplitudes = np.maximum(amplitudes, 1e-8)
+
+    return amplitudes
+
+
+def adaptive_t2_estimation(
+    time_axis: np.ndarray,
+    signal: np.ndarray,
+    n_components: int = 64,
+    svd_rank: int = 2,
+    n_iter: int = 300,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """
+    Estimate the initial T2 information for PINN training using the manuscript workflow.
+
+    Returns:
+        effective_t2: scalar summary used for logging
+        t2_bins: predefined logarithmic T2 bins
+        amplitudes: non-negative amplitudes for the bins
+    """
+    filtered_signal = hankel_svd_filter(signal, rank=svd_rank)
+    filtered_signal = np.clip(filtered_signal, 0.0, None)
+
+    positive_dt = np.diff(time_axis)[np.diff(time_axis) > 0]
+    t2_min = max(TE, float(np.min(positive_dt)))
+    t2_max = max(float(time_axis[-1]) * 2.0, t2_min * 10.0)
+    t2_bins = np.logspace(np.log10(t2_min), np.log10(t2_max), n_components).astype(np.float32)
+
+    kernel = np.exp(-time_axis[:, None] / t2_bins[None, :]).astype(np.float32)
+    amplitudes = estimate_nonnegative_amplitudes(kernel, filtered_signal, max_iter=n_iter)
+    effective_t2 = float(np.sum(amplitudes * t2_bins) / np.sum(amplitudes))
+
+    return effective_t2, t2_bins, amplitudes
+
+
+class TimeAwareBlock(tf.keras.layers.Layer):
+    """Temporal feature extraction block with GRU and self-attention."""
+
+    def __init__(self):
+        super().__init__()
+        self.gru = tf.keras.layers.GRU(64, return_sequences=False)
+        self.attn = tf.keras.layers.Attention(use_scale=True)
+        self.dense = tf.keras.layers.Dense(128, activation="swish")
+
+    def call(self, inputs):
+        if len(inputs.shape) == 2:
+            x = tf.expand_dims(inputs, axis=1)
+        else:
+            x = inputs
+
+        gru_out = self.gru(x)
+        attn_input = tf.expand_dims(gru_out, axis=1)
+        attn_out = self.attn([attn_input, attn_input])
+        return self.dense(attn_out[:, -1, :])
+
+
+class EnhancedPINN(tf.keras.Model):
+    """Enhanced PINN used in the manuscript."""
+
+    def __init__(self):
+        super().__init__()
+        self.input_norm = tf.keras.layers.BatchNormalization()
+        self.block1 = TimeAwareBlock()
+        self.block2 = TimeAwareBlock()
+        self.skip_conv = tf.keras.layers.Conv1D(1, 3, padding="same")
+        self.output_layer = tf.keras.layers.Dense(1)
+
+    def call(self, inputs):
+        if len(inputs.shape) == 2:
+            x = tf.expand_dims(inputs, axis=1)
+        else:
+            x = inputs
+
+        x = self.input_norm(x)
+        x1 = self.block1(x[:, -1, :])
+        x2 = self.block2(tf.expand_dims(x1, axis=1))
+        skip = self.skip_conv(x)
+        return self.output_layer(x2) + skip[:, -1, :]
+
+
+class AdaptivePhysicsLoss:
+    """
+    Hybrid manuscript loss function.
+
+    Data term:
+        mean absolute error between the predicted and observed echo signal.
+
+    Physics term:
+        relative mismatch between the predicted decay gradient and the
+        multi-exponential Bloch decay gradient, with a 10 percent tolerance.
+    """
+
+    def __init__(
+        self,
+        effective_t2: float,
+        t2_bins: np.ndarray,
+        amplitudes: np.ndarray,
+        signal_range: tuple[float, float],
+        time_axis: np.ndarray,
+    ):
+        self.effective_t2 = tf.constant(effective_t2, dtype=tf.float32)
+        self.t2_bins = tf.constant(t2_bins.reshape(1, -1), dtype=tf.float32)
+        self.amplitudes = tf.constant(amplitudes.reshape(1, -1), dtype=tf.float32)
+        self.signal_min, self.signal_max = signal_range
+        self.eps = tf.constant(1e-8, dtype=tf.float32)
+
+        self.alpha = tf.Variable(0.1, trainable=False)
+        self.beta = tf.Variable(0.1, trainable=False)
+
+        t_mid = 0.5 * (time_axis[1:] + time_axis[:-1])
+        self.t_mid = tf.constant(t_mid.reshape(-1, 1), dtype=tf.float32)
+        self.theoretical_decay = tf.reduce_sum(
+            (self.amplitudes / self.t2_bins) * tf.exp(-self.t_mid / self.t2_bins),
+            axis=1,
+        )
+
+    def denormalize(self, values):
+        return values * (self.signal_max - self.signal_min) + self.signal_min
+
+    def __call__(self, y_true, y_pred):
+        signal_true = self.denormalize(y_true)
+        signal_pred = self.denormalize(y_pred)
+
+        data_loss = tf.reduce_mean(tf.abs(signal_pred - signal_true))
+
+        predicted_decay = -(signal_pred[1:, 0] - signal_pred[:-1, 0]) / TE
+        relative_error = tf.abs(predicted_decay - self.theoretical_decay) / (
+            tf.abs(self.theoretical_decay) + self.eps
+        )
+        physics_loss = tf.reduce_mean(tf.square(tf.nn.relu(relative_error - 0.10)))
+
+        self.alpha.assign(tf.clip_by_value(self.alpha * 1.001, 0.1, 0.5))
+        self.beta.assign(tf.clip_by_value(self.beta, 0.1, 0.1))
+
+        return data_loss + self.alpha * physics_loss
+
+
+def save_results(
+    time_axis: np.ndarray,
+    raw_signal: np.ndarray,
+    filtered_signal: np.ndarray,
+    filename: str = OUTPUT_XLSX,
+) -> None:
+    """Write the review table and embed a comparison chart in the Excel file."""
+    assert len(time_axis) == len(raw_signal) == len(filtered_signal), "Length mismatch."
+
+    data_frame = pd.DataFrame(
+        {
+            "time_s": time_axis,
+            "raw_signal": raw_signal,
+            "filtered_signal": filtered_signal,
+        }
+    )
+
+    with pd.ExcelWriter(filename, engine="xlsxwriter") as writer:
+        data_frame.to_excel(writer, index=False, sheet_name="filter_results")
+
+        workbook = writer.book
+        worksheet = writer.sheets["filter_results"]
+        num_format = workbook.add_format({"num_format": "0.0000E+00"})
+        worksheet.set_column("A:C", 18, num_format)
+
+        chart = workbook.add_chart({"type": "scatter", "subtype": "straight"})
+        chart.add_series(
+            {
+                "name": "raw_signal",
+                "categories": ["filter_results", 1, 0, len(time_axis), 0],
+                "values": ["filter_results", 1, 1, len(time_axis), 1],
+                "line": {"color": "blue", "transparency": 50},
+            }
+        )
+        chart.add_series(
+            {
+                "name": "filtered_signal",
+                "categories": ["filter_results", 1, 0, len(time_axis), 0],
+                "values": ["filter_results", 1, 2, len(time_axis), 2],
+                "line": {"color": "red"},
+            }
+        )
+        chart.set_title({"name": "Signal filtering comparison"})
+        chart.set_x_axis({"name": "Time (s)"})
+        chart.set_y_axis({"name": "Amplitude", "major_gridlines": {"visible": True}})
+        worksheet.insert_chart("E2", chart)
+
+    print(f"Saved review table to {filename}")
+
+
+def save_time_frequency_plot(
+    time_axis: np.ndarray,
+    raw_signal: np.ndarray,
+    filtered_signal: np.ndarray,
+    filename: str = OUTPUT_PLOT,
+) -> None:
+    """Save a diagnostic plot for the time-domain and frequency-domain comparison."""
+    plt.figure(figsize=(15, 8))
+
+    plt.subplot(211)
+    plt.plot(time_axis, raw_signal, "b-", alpha=0.3, label="Raw signal")
+    plt.plot(time_axis, filtered_signal, "r-", linewidth=1.5, label="Filtered signal")
+    plt.title("Time-domain comparison")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.legend()
+
+    n_samples = len(raw_signal)
+    frequencies = np.fft.rfftfreq(n_samples, d=TE)
+    raw_fft = np.abs(np.fft.rfft(raw_signal))
+    filtered_fft = np.abs(np.fft.rfft(filtered_signal))
+
+    plt.subplot(212)
+    plt.semilogy(frequencies, raw_fft, "b-", alpha=0.5, label="Raw spectrum")
+    plt.semilogy(frequencies, filtered_fft, "r-", label="Filtered spectrum")
+    plt.title("Frequency-domain comparison")
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Amplitude")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300)
+    plt.close()
+    print(f"Saved diagnostic plot to {filename}")
+
+
+def train_pinn(
+    time_axis: np.ndarray,
+    raw_signal: np.ndarray,
+    time_norm: np.ndarray,
+    signal_norm: np.ndarray,
+    signal_min: float,
+    signal_max: float,
+) -> np.ndarray:
+    """Train the manuscript PINN and return the filtered signal."""
+    effective_t2, t2_bins, amplitudes = adaptive_t2_estimation(time_axis, raw_signal)
+    print(f"SVD-based T2 estimate: {effective_t2:.4f} s")
+
+    model = EnhancedPINN()
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+    loss_fn = AdaptivePhysicsLoss(
+        effective_t2=effective_t2,
+        t2_bins=t2_bins,
+        amplitudes=amplitudes,
+        signal_range=(signal_min, signal_max),
+        time_axis=time_axis,
+    )
+
+    time_tensor = tf.convert_to_tensor(time_norm.reshape(-1, 1), dtype=tf.float32)
+    signal_tensor = tf.convert_to_tensor(signal_norm.reshape(-1, 1), dtype=tf.float32)
+
+    @tf.function(jit_compile=True)
+    def train_step():
+        with tf.GradientTape() as tape:
+            signal_pred = model(time_tensor)
+            total_loss = loss_fn(signal_tensor, signal_pred)
+        gradients = tape.gradient(total_loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        return total_loss
+
+    phases = [
+        {"epochs": 2000, "lr": 0.001},
+        {"epochs": 2000, "lr": 0.0003},
+    ]
+
+    for phase in phases:
+        optimizer.learning_rate = phase["lr"]
+        for epoch in range(phase["epochs"]):
+            loss = train_step()
+            if epoch % 500 == 0:
+                print(
+                    f"Epoch {epoch:4d} | Loss: {loss.numpy():.3e} | "
+                    f"LR: {optimizer.learning_rate.numpy():.3e}"
+                )
+
+    signal_clean_norm = model(time_tensor).numpy().flatten()
+    signal_clean = signal_clean_norm * (signal_max - signal_min) + signal_min
+    return np.clip(signal_clean, 0, None)
+
+
+def main() -> None:
+    """Run the complete low-SNR NMR filtering workflow."""
+    time_axis, raw_signal = load_input_signal(DATA_PATH)
+    signal_norm, signal_min, signal_max = minmax_normalize(raw_signal)
+    time_norm, _, _ = minmax_normalize(time_axis)
+
+    filtered_signal = train_pinn(
+        time_axis=time_axis,
+        raw_signal=raw_signal,
+        time_norm=time_norm,
+        signal_norm=signal_norm,
+        signal_min=signal_min,
+        signal_max=signal_max,
+    )
+
+    save_results(time_axis, raw_signal, filtered_signal, filename=OUTPUT_XLSX)
+    save_time_frequency_plot(time_axis, raw_signal, filtered_signal, filename=OUTPUT_PLOT)
+
+
+if __name__ == "__main__":
+    main()
